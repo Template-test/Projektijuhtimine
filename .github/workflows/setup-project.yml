@@ -1,0 +1,125 @@
+name: Initialize GitHub Project with predefined tasks
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_title:
+        description: "Name of the new GitHub Project"
+        required: true
+        default: "Course workboard"
+
+permissions:
+  contents: read
+  issues: write
+  projects: write
+
+jobs:
+  setup-project:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create project and tasks
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const ownerLogin = context.repo.owner;
+            const repoName = context.repo.repo;
+            const projectTitle = core.getInput("project_title");
+
+            // 1. Determine whether owner is user or organization and get its ID
+            const ownerQuery = `
+              query($login: String!) {
+                organization(login: $login) { id }
+                user(login: $login) { id }
+              }
+            `;
+
+            const ownerResult = await github.graphql(ownerQuery, { login: ownerLogin });
+
+            let ownerId;
+            if (ownerResult.organization && ownerResult.organization.id) {
+              ownerId = ownerResult.organization.id;
+            } else if (ownerResult.user && ownerResult.user.id) {
+              ownerId = ownerResult.user.id;
+            } else {
+              core.setFailed("Could not resolve owner as organization or user");
+              return;
+            }
+
+            // 2. Create ProjectV2 for this owner
+            const createProjectMutation = `
+              mutation($ownerId: ID!, $title: String!) {
+                createProjectV2(input: { ownerId: $ownerId, title: $title }) {
+                  projectV2 {
+                    id
+                    url
+                  }
+                }
+              }
+            `;
+
+            const createProjectResult = await github.graphql(createProjectMutation, {
+              ownerId,
+              title: projectTitle
+            });
+
+            const project = createProjectResult.createProjectV2.projectV2;
+            core.info(\`Created project: \${project.url}\`);
+
+            // 3. Define predefined tasks as issues
+            // Edit this array to match your template
+            const tasks = [
+              {
+                title: "Read course instructions",
+                body: "Read the README in this repository and the CONTRIBUTING guidelines."
+              },
+              {
+                title: "Set up local development environment",
+                body: "Install required tools, clone the repository and run the project locally."
+              },
+              {
+                title: "Complete Task 1",
+                body: "Follow Task 1 instructions in the docs folder."
+              },
+              {
+                title: "Complete Task 2",
+                body: "Follow Task 2 instructions in the docs folder."
+              }
+            ];
+
+            // 4. Create issues for each task
+            const createdIssues = [];
+            for (const task of tasks) {
+              const issue = await github.rest.issues.create({
+                owner: ownerLogin,
+                repo: repoName,
+                title: task.title,
+                body: task.body,
+                labels: ["task"]
+              });
+              createdIssues.push(issue.data);
+              core.info(\`Created issue #\${issue.data.number}: \${issue.data.title}\`);
+            }
+
+            // 5. Add each issue to the project as an item
+            const addItemMutation = `
+              mutation($projectId: ID!, $contentId: ID!) {
+                addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                  item {
+                    id
+                  }
+                }
+              }
+            `;
+
+            for (const issue of createdIssues) {
+              const contentId = issue.node_id;
+              await github.graphql(addItemMutation, {
+                projectId: project.id,
+                contentId
+              });
+              core.info(\`Added issue #\${issue.number} to project\`);
+            }
+
+            core.notice(\`Project initialization complete. Project URL: \${project.url}\`);
