@@ -28,23 +28,33 @@ jobs:
             const projectTitle = core.getInput("project_title");
 
             // 1. Determine whether owner is user or organization and get its ID
-            const ownerQuery = `
-              query($login: String!) {
-                organization(login: $login) { id }
-                user(login: $login) { id }
-              }
-            `;
-
-            const ownerResult = await github.graphql(ownerQuery, { login: ownerLogin });
-
             let ownerId;
-            if (ownerResult.organization && ownerResult.organization.id) {
-              ownerId = ownerResult.organization.id;
-            } else if (ownerResult.user && ownerResult.user.id) {
-              ownerId = ownerResult.user.id;
-            } else {
-              core.setFailed("Could not resolve owner as organization or user");
-              return;
+
+            // Try organization first
+            try {
+              const orgQuery = `
+                query($login: String!) {
+                  organization(login: $login) { id }
+                }
+              `;
+              const orgResult = await github.graphql(orgQuery, { login: ownerLogin });
+              ownerId = orgResult.organization.id;
+              core.info(`Found organization: ${ownerLogin}`);
+            } catch (orgError) {
+              // If not an organization, try user
+              try {
+                const userQuery = `
+                  query($login: String!) {
+                    user(login: $login) { id }
+                  }
+                `;
+                const userResult = await github.graphql(userQuery, { login: ownerLogin });
+                ownerId = userResult.user.id;
+                core.info(`Found user: ${ownerLogin}`);
+              } catch (userError) {
+                core.setFailed("Could not resolve owner as organization or user");
+                return;
+              }
             }
 
             // 2. Create ProjectV2 for this owner
