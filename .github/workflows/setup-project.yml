@@ -65,7 +65,7 @@ jobs:
             });
 
             const project = createProjectResult.createProjectV2.projectV2;
-            core.info(\`Created project: \${project.url}\`);
+            core.info(`Created project: ${project.url}`);
 
             // 3. Define predefined tasks as issues
             // Edit this array to match your template
@@ -99,7 +99,7 @@ jobs:
                 labels: ["task"]
               });
               createdIssues.push(issue.data);
-              core.info(\`Created issue #\${issue.data.number}: \${issue.data.title}\`);
+              core.info(`Created issue #${issue.data.number}: ${issue.data.title}`);
             }
 
             // 5. Add each issue to the project as an item
@@ -119,7 +119,7 @@ jobs:
                 projectId: project.id,
                 contentId
               });
-              core.info(\`Added issue #\${issue.number} to project\`);
+              core.info(`Added issue #${issue.number} to project`);
             }
 
-            core.notice(\`Project initialization complete. Project URL: \${project.url}\`);
+            core.notice(`Project initialization complete. Project URL: ${project.url}`);
