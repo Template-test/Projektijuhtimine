@@ -35,7 +35,8 @@ jobs:
           script: |
             const ownerLogin = context.repo.owner;
             const repoName = context.repo.repo;
-            const projectTitle = (context.payload.inputs && context.payload.inputs.project_title && context.payload.inputs.project_title.trim()) || "Course workboard";
+            // Use repository name as the project name
+            const projectTitle = repoName;
             const hasAppToken = '${{ steps.generate-token.outputs.token }}' !== '';
 
             core.info(`Setting up tasks for repository: ${ownerLogin}/${repoName}`);
@@ -168,7 +169,83 @@ jobs:
               core.notice('');
               core.notice(`✅ Added ${added} issues to Classic Project`);
               core.notice(`📊 View project board: ${classicProject.html_url}`);
-            } else if (projectV2 && createdIssues.length > 0) {
+            } else if (projectV2) {
+              // Link org Project (v2) to this repository when possible
+              try {
+                core.info('Linking Project (v2) to current repository...');
+                const repoNode = await github.graphql(`
+                  query($owner: String!, $name: String!) {
+                    repository(owner: $owner, name: $name) { id nameWithOwner }
+                  }
+                `, { owner: ownerLogin, name: repoName });
+
+                const linkMutation = `
+                  mutation($projectId: ID!, $repositoryId: ID!) {
+                    linkProjectV2ToRepository(input: { projectId: $projectId, repositoryId: $repositoryId }) {
+                      clientMutationId
+                    }
+                  }
+                `;
+
+                await github.graphql(linkMutation, { projectId: projectV2.id, repositoryId: repoNode.repository.id });
+                core.info('✅ Linked Project (v2) to repository');
+                core.notice('');
+                core.notice('🔗 Project (v2) linked to this repository.');
+                core.notice(`   Repository Projects tab: https://github.com/${ownerLogin}/${repoName}/projects`);
+              } catch (linkErr) {
+                core.warning(`Could not link Project (v2) to repository: ${linkErr.message}`);
+                core.notice('');
+                core.notice('ℹ️ You can link this project to the repository manually:');
+                core.notice('   Open project → menu (⋯) → Link to a repository → select this repo.');
+              }
+
+              // Ensure a Board view exists and set it as default if possible
+              try {
+                const viewsData = await github.graphql(`
+                  query($id: ID!) {
+                    node(id: $id) {
+                      ... on ProjectV2 {
+                        id
+                        views(first: 20) { nodes { id name layout } }
+                      }
+                    }
+                  }
+                `, { id: projectV2.id });
+
+                let boardView = viewsData.node.views.nodes.find(v => v.layout === 'BOARD' || (v.name || '').toLowerCase() === 'board');
+                if (!boardView) {
+                  const createdView = await github.graphql(`
+                    mutation($projectId: ID!) {
+                      createProjectV2View(input: { projectId: $projectId, name: "Board", layout: BOARD }) {
+                        projectV2View { id name layout }
+                      }
+                    }
+                  `, { projectId: projectV2.id });
+                  boardView = createdView.createProjectV2View.projectV2View;
+                  core.info('Created Board view for Project (v2)');
+                }
+
+                // Try to make Board the default view (may not be supported in all orgs)
+                try {
+                  await github.graphql(`
+                    mutation($projectId: ID!, $viewId: ID!) {
+                      updateProjectV2(input: { projectId: $projectId, defaultViewId: $viewId }) {
+                        projectV2 { id }
+                      }
+                    }
+                  `, { projectId: projectV2.id, viewId: boardView.id });
+                  core.info('✅ Set Board as the default view');
+                } catch (setErr) {
+                  core.warning(`Could not set Board as default view: ${setErr.message}`);
+                  core.notice('');
+                  core.notice('ℹ️ If default view cannot be set via API, you can set it manually:');
+                  core.notice('   Project → Views (⋯) → Set as default on the Board view.');
+                }
+              } catch (viewsErr) {
+                core.warning(`Could not ensure Board view: ${viewsErr.message}`);
+              }
+
+              // Add created issues to the Project (v2)
               core.info('Adding issues to Project (v2)...');
               const addItemMutation = `
                 mutation($projectId: ID!, $contentId: ID!) {
