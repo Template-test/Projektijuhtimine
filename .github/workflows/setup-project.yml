@@ -35,60 +35,70 @@ jobs:
           script: |
             const ownerLogin = context.repo.owner;
             const repoName = context.repo.repo;
-            const projectTitle = core.getInput("project_title") || "Course workboard";
+            const projectTitle = (context.payload.inputs && context.payload.inputs.project_title && context.payload.inputs.project_title.trim()) || "Course workboard";
             const hasAppToken = '${{ steps.generate-token.outputs.token }}' !== '';
 
             core.info(`Setting up tasks for repository: ${ownerLogin}/${repoName}`);
 
-            // Try to create organization-level project if GitHub App token is available
-            let project = null;
+            // Try to create a repository-level Classic Project first
+            // If Classic Projects are disabled (404/410), fall back to org-level ProjectV2 (if App token present)
+            let classicProject = null;
+            let projectV2 = null;
 
-            if (hasAppToken) {
-              try {
-                core.info('GitHub App token found - creating organization project...');
-                
-                // Get organization ID
-                const orgQuery = `
-                  query($login: String!) {
-                    organization(login: $login) { 
-                      id 
-                      login
-                    }
-                  }
-                `;
-                
-                const orgResult = await github.graphql(orgQuery, { login: ownerLogin });
-                const ownerId = orgResult.organization.id;
-                core.info(`Found organization: ${orgResult.organization.login}`);
+            try {
+              core.info('Attempting to create repository Classic Project...');
+              const created = await github.rest.projects.createForRepo({
+                owner: ownerLogin,
+                repo: repoName,
+                name: projectTitle
+              });
+              classicProject = created.data;
+              core.info(`✅ Created repo Classic Project #${classicProject.number}: ${classicProject.html_url}`);
 
-                // Create ProjectV2 for organization
-                const createProjectMutation = `
-                  mutation($ownerId: ID!, $title: String!) {
-                    createProjectV2(input: { ownerId: $ownerId, title: $title }) {
-                      projectV2 {
+              // Ensure common columns exist
+              const desiredColumns = ["To do", "In progress", "Done"];
+              const existingCols = await github.rest.projects.listColumns({ project_id: classicProject.id });
+              const byName = new Map(existingCols.data.map(c => [c.name, c]));
+              for (const col of desiredColumns) {
+                if (!byName.has(col)) {
+                  const c = await github.rest.projects.createColumn({ project_id: classicProject.id, name: col });
+                  byName.set(col, c.data);
+                }
+              }
+            } catch (err) {
+              const msg = err?.message || String(err);
+              const status = err?.status;
+              core.warning(`Repo Classic Project creation failed (${status || 'no-status'}): ${msg}`);
+              if (hasAppToken) {
+                try {
+                  core.info('Falling back to organization Project (Projects v2) using App token...');
+                  const orgQuery = `
+                    query($login: String!) {
+                      organization(login: $login) {
                         id
-                        url
-                        number
+                        login
                       }
                     }
-                  }
-                `;
+                  `;
+                  const orgResult = await github.graphql(orgQuery, { login: ownerLogin });
+                  const ownerId = orgResult.organization.id;
 
-                const createProjectResult = await github.graphql(createProjectMutation, {
-                  ownerId,
-                  title: projectTitle
-                });
-
-                project = createProjectResult.createProjectV2.projectV2;
-                core.info(`✅ Created organization project #${project.number}: ${project.url}`);
-                
-              } catch (error) {
-                core.warning(`Could not create organization project: ${error.message}`);
-                core.info('Continuing with issues only...');
+                  const createProjectMutation = `
+                    mutation($ownerId: ID!, $title: String!) {
+                      createProjectV2(input: { ownerId: $ownerId, title: $title }) {
+                        projectV2 { id url number }
+                      }
+                    }
+                  `;
+                  const createProjectResult = await github.graphql(createProjectMutation, { ownerId, title: projectTitle });
+                  projectV2 = createProjectResult.createProjectV2.projectV2;
+                  core.info(`✅ Created organization Project (v2) #${projectV2.number}: ${projectV2.url}`);
+                } catch (e2) {
+                  core.warning(`Could not create organization Project (v2): ${e2.message}`);
+                }
+              } else {
+                core.info('GitHub App not configured; skipping organization Project creation.');
               }
-            } else {
-              core.info('GitHub App not configured - will create issues only');
-              core.info('To enable automatic project creation, set up a GitHub App (see workflow output)');
             }
 
             // Define predefined tasks as issues
@@ -135,44 +145,54 @@ jobs:
             core.notice(`🎉 Successfully created ${createdIssues.length} task issues!`);
             core.notice(`📋 View them at: https://github.com/${ownerLogin}/${repoName}/issues`);
 
-            // If project was created, add issues to it
-            if (project && createdIssues.length > 0) {
-              core.info('Adding issues to project...');
-              
+            // Add issues to whichever project exists
+            if (classicProject && createdIssues.length > 0) {
+              core.info('Adding issues to Classic Project...');
+              // Prefer "To do" column if present; else first column
+              const cols = await github.rest.projects.listColumns({ project_id: classicProject.id });
+              const todoCol = cols.data.find(c => c.name.toLowerCase() === 'to do') || cols.data[0];
+              let added = 0;
+              for (const issue of createdIssues) {
+                try {
+                  await github.rest.projects.createCard({
+                    column_id: todoCol.id,
+                    content_id: issue.id,
+                    content_type: 'Issue'
+                  });
+                  added++;
+                  core.info(`Added issue #${issue.number} to Classic Project`);
+                } catch (e) {
+                  core.warning(`Could not add issue #${issue.number} to Classic Project: ${e.message}`);
+                }
+              }
+              core.notice('');
+              core.notice(`✅ Added ${added} issues to Classic Project`);
+              core.notice(`📊 View project board: ${classicProject.html_url}`);
+            } else if (projectV2 && createdIssues.length > 0) {
+              core.info('Adding issues to Project (v2)...');
               const addItemMutation = `
                 mutation($projectId: ID!, $contentId: ID!) {
-                  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
-                    item {
-                      id
-                    }
-                  }
+                  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) { item { id } }
                 }
               `;
-
               let addedCount = 0;
               for (const issue of createdIssues) {
                 try {
-                  await github.graphql(addItemMutation, {
-                    projectId: project.id,
-                    contentId: issue.node_id
-                  });
+                  await github.graphql(addItemMutation, { projectId: projectV2.id, contentId: issue.node_id });
                   addedCount++;
-                  core.info(`Added issue #${issue.number} to project`);
+                  core.info(`Added issue #${issue.number} to Project (v2)`);
                 } catch (error) {
-                  core.warning(`Could not add issue #${issue.number}: ${error.message}`);
+                  core.warning(`Could not add issue #${issue.number} to Project (v2): ${error.message}`);
                 }
               }
-              
-              core.notice(``);
-              core.notice(`✅ Added ${addedCount} issues to project!`);
-              core.notice(`📊 View project board: ${project.url}`);
-            } else if (!hasAppToken) {
-              core.notice(``);
-              core.notice(`💡 To enable automatic project creation:`);
-              core.notice(`   1. Create a GitHub App (see: https://docs.github.com/apps/creating-github-apps)`);
-              core.notice(`   2. Grant it 'Repository administration' and 'Organization projects' permissions`);
-              core.notice(`   3. Install it on your organization`);
-              core.notice(`   4. Add APP_ID as a variable and APP_PRIVATE_KEY as a secret`);
-              core.notice(`   OR`);
-              core.notice(`   Simply create a project manually and add issues with label:task`);
+              core.notice('');
+              core.notice(`✅ Added ${addedCount} issues to Project (v2)`);
+              core.notice(`📊 View project board: ${projectV2.url}`);
+            } else {
+              core.notice('');
+              core.notice('ℹ️ Skipped adding issues to a project.');
+              core.notice('   - To create a repo-attached board, enable Classic Projects');
+              core.notice('     Org: Settings → Projects (classic) → Enable');
+              core.notice('     Repo: Settings → Features → Projects');
+              core.notice('   - Or configure the GitHub App to allow org Project (v2) creation.');
             }
