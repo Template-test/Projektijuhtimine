@@ -187,16 +187,22 @@ jobs:
                   }
                 `;
 
-                await github.graphql(linkMutation, { projectId: projectV2.id, repositoryId: repoNode.repository.id });
+                await github.graphql(linkMutation, { projectId: projectV2.id, repositoryId: repoNode.repository.id, headers: { 'GraphQL-Features': 'projects_next_graphql' } });
                 core.info('✅ Linked Project (v2) to repository');
                 core.notice('');
                 core.notice('🔗 Project (v2) linked to this repository.');
                 core.notice(`   Repository Projects tab: https://github.com/${ownerLogin}/${repoName}/projects`);
               } catch (linkErr) {
-                core.warning(`Could not link Project (v2) to repository: ${linkErr.message}`);
+                const msg = linkErr?.message || String(linkErr);
+                core.warning(`Could not link Project (v2) to repository: ${msg}`);
                 core.notice('');
                 core.notice('ℹ️ You can link this project to the repository manually:');
                 core.notice('   Open project → menu (⋯) → Link to a repository → select this repo.');
+                core.notice('');
+                core.notice('If automation should link it, check:');
+                core.notice(' - The GitHub App is installed on this repository (selected repos or all repos).');
+                core.notice(' - App permissions include Organization projects: write and Repository metadata: read.');
+                core.notice(' - Re-run this workflow after installing/updating the App.');
               }
 
               // Ensure a Board view exists and set it as default if possible
