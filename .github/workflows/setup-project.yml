@@ -12,60 +12,83 @@ permissions:
   contents: read
   issues: write
   repository-projects: write
+  id-token: write
 
 jobs:
   setup-project:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Generate GitHub App Token
+        id: generate-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+        continue-on-error: true
+
       - name: Create project and tasks
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.PROJECT_PAT || secrets.GITHUB_TOKEN }}
+          github-token: ${{ steps.generate-token.outputs.token || secrets.GITHUB_TOKEN }}
           script: |
             const ownerLogin = context.repo.owner;
             const repoName = context.repo.repo;
             const projectTitle = core.getInput("project_title") || "Course workboard";
+            const hasAppToken = '${{ steps.generate-token.outputs.token }}' !== '';
 
-            core.info(`Setting up project for repository: ${ownerLogin}/${repoName}`);
+            core.info(`Setting up tasks for repository: ${ownerLogin}/${repoName}`);
 
-            // Create a repository-linked project
+            // Try to create organization-level project if GitHub App token is available
             let project = null;
 
-            try {
-              core.info('Creating repository-linked project...');
-              
-              // Use REST API to create a classic project (repository-level)
-              // Note: ProjectsV2 (new projects) can only be created at org/user level
-              // Classic projects can be linked to repositories
-              const projectResponse = await github.rest.projects.createForRepo({
-                owner: ownerLogin,
-                repo: repoName,
-                name: projectTitle,
-                body: 'Automated project board for course tasks'
-              });
-              
-              project = projectResponse.data;
-              core.info(`✅ Created repository project: ${project.html_url}`);
-              
-              // Create default columns for the project
-              const columns = ['To Do', 'In Progress', 'Done'];
-              const createdColumns = [];
-              
-              for (const columnName of columns) {
-                const column = await github.rest.projects.createColumn({
-                  project_id: project.id,
-                  name: columnName
+            if (hasAppToken) {
+              try {
+                core.info('GitHub App token found - creating organization project...');
+                
+                // Get organization ID
+                const orgQuery = `
+                  query($login: String!) {
+                    organization(login: $login) { 
+                      id 
+                      login
+                    }
+                  }
+                `;
+                
+                const orgResult = await github.graphql(orgQuery, { login: ownerLogin });
+                const ownerId = orgResult.organization.id;
+                core.info(`Found organization: ${orgResult.organization.login}`);
+
+                // Create ProjectV2 for organization
+                const createProjectMutation = `
+                  mutation($ownerId: ID!, $title: String!) {
+                    createProjectV2(input: { ownerId: $ownerId, title: $title }) {
+                      projectV2 {
+                        id
+                        url
+                        number
+                      }
+                    }
+                  }
+                `;
+
+                const createProjectResult = await github.graphql(createProjectMutation, {
+                  ownerId,
+                  title: projectTitle
                 });
-                createdColumns.push(column.data);
-                core.info(`Created column: ${columnName}`);
+
+                project = createProjectResult.createProjectV2.projectV2;
+                core.info(`✅ Created organization project #${project.number}: ${project.url}`);
+                
+              } catch (error) {
+                core.warning(`Could not create organization project: ${error.message}`);
+                core.info('Continuing with issues only...');
               }
-              
-              project.columns = createdColumns;
-              
-            } catch (error) {
-              core.warning(`Could not create repository project: ${error.message}`);
-              core.warning('Continuing with issues only...');
+            } else {
+              core.info('GitHub App not configured - will create issues only');
+              core.info('To enable automatic project creation, set up a GitHub App (see workflow output)');
             }
 
             // Define predefined tasks as issues
@@ -91,7 +114,6 @@ jobs:
 
             // Create issues for each task
             const createdIssues = [];
-            let issuesEnabled = true;
 
             for (const task of tasks) {
               try {
@@ -103,57 +125,54 @@ jobs:
                   labels: ["task"]
                 });
                 createdIssues.push(issue.data);
-                core.info(`Created issue #${issue.data.number}: ${issue.data.title}`);
+                core.info(`✅ Created issue #${issue.data.number}: ${issue.data.title}`);
               } catch (error) {
-                if (error.status === 404) {
-                  issuesEnabled = false;
-                  core.warning('Issues are not enabled for this repository!');
-                  core.warning('Please enable Issues in repository Settings → General → Features');
-                  break;
-                } else if (error.status === 410) {
-                  issuesEnabled = false;
-                  core.warning('Issues have been disabled for this repository!');
-                  break;
-                } else {
-                  throw error;
-                }
+                core.error(`Failed to create issue "${task.title}": ${error.message}`);
+                throw error;
               }
             }
 
-            // If we created a project, add issues to it
+            core.notice(`🎉 Successfully created ${createdIssues.length} task issues!`);
+            core.notice(`📋 View them at: https://github.com/${ownerLogin}/${repoName}/issues`);
+
+            // If project was created, add issues to it
             if (project && createdIssues.length > 0) {
               core.info('Adding issues to project...');
               
-              // Add issues to the "To Do" column (first column)
-              const todoColumn = project.columns[0];
-              
+              const addItemMutation = `
+                mutation($projectId: ID!, $contentId: ID!) {
+                  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                    item {
+                      id
+                    }
+                  }
+                }
+              `;
+
+              let addedCount = 0;
               for (const issue of createdIssues) {
                 try {
-                  await github.rest.projects.createCard({
-                    column_id: todoColumn.id,
-                    content_id: issue.id,
-                    content_type: 'Issue'
+                  await github.graphql(addItemMutation, {
+                    projectId: project.id,
+                    contentId: issue.node_id
                   });
+                  addedCount++;
                   core.info(`Added issue #${issue.number} to project`);
                 } catch (error) {
-                  core.warning(`Could not add issue #${issue.number} to project: ${error.message}`);
+                  core.warning(`Could not add issue #${issue.number}: ${error.message}`);
                 }
               }
               
-              core.notice(`✅ Successfully created ${createdIssues.length} task issues and added them to project!`);
-              core.notice(`📋 View project at: ${project.html_url}`);
-            } else if (project && !issuesEnabled) {
-              core.notice(`✅ Created repository project: ${project.html_url}`);
-              core.notice(`⚠️ Issues are not enabled - please enable them in repository settings`);
-              core.notice(`   Then manually add tasks to the project, or re-run this workflow`);
-            } else if (createdIssues.length > 0) {
-              core.notice(`✅ Successfully created ${createdIssues.length} task issues!`);
-              core.notice(`📋 View them at: https://github.com/${ownerLogin}/${repoName}/issues`);
-              core.notice(`💡 Project board was not created. Check repository permissions.`);
-            } else if (!issuesEnabled) {
-              core.setFailed('⚠️ Issues are not enabled for this repository!');
-              core.notice('Please enable Issues in: Repository Settings → General → Features → Issues');
-              if (project) {
-                core.notice(`Project was created: ${project.html_url}`);
-              }
+              core.notice(``);
+              core.notice(`✅ Added ${addedCount} issues to project!`);
+              core.notice(`📊 View project board: ${project.url}`);
+            } else if (!hasAppToken) {
+              core.notice(``);
+              core.notice(`💡 To enable automatic project creation:`);
+              core.notice(`   1. Create a GitHub App (see: https://docs.github.com/apps/creating-github-apps)`);
+              core.notice(`   2. Grant it 'Repository administration' and 'Organization projects' permissions`);
+              core.notice(`   3. Install it on your organization`);
+              core.notice(`   4. Add APP_ID as a variable and APP_PRIVATE_KEY as a secret`);
+              core.notice(`   OR`);
+              core.notice(`   Simply create a project manually and add issues with label:task`);
             }
