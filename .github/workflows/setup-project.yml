@@ -25,42 +25,28 @@ jobs:
           script: |
             const ownerLogin = context.repo.owner;
             const repoName = context.repo.repo;
-            const projectTitle = core.getInput("project_title");
+            const projectTitle = core.getInput("project_title") || "Course workboard";
 
-            // 1. Determine whether owner is user or organization and get its ID
-            let ownerId;
-
-            // Try organization first
-            try {
-              const orgQuery = `
-                query($login: String!) {
-                  organization(login: $login) { id }
+            // 1. Get repository ID (we'll create the project at repo level, not org level)
+            const repoQuery = `
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  id
                 }
-              `;
-              const orgResult = await github.graphql(orgQuery, { login: ownerLogin });
-              ownerId = orgResult.organization.id;
-              core.info(`Found organization: ${ownerLogin}`);
-            } catch (orgError) {
-              // If not an organization, try user
-              try {
-                const userQuery = `
-                  query($login: String!) {
-                    user(login: $login) { id }
-                  }
-                `;
-                const userResult = await github.graphql(userQuery, { login: ownerLogin });
-                ownerId = userResult.user.id;
-                core.info(`Found user: ${ownerLogin}`);
-              } catch (userError) {
-                core.setFailed("Could not resolve owner as organization or user");
-                return;
               }
-            }
+            `;
 
-            // 2. Create ProjectV2 for this owner
+            const repoResult = await github.graphql(repoQuery, { 
+              owner: ownerLogin, 
+              repo: repoName 
+            });
+            const repoId = repoResult.repository.id;
+            core.info(`Found repository: ${ownerLogin}/${repoName}`);
+
+            // 2. Create ProjectV2 for this repository
             const createProjectMutation = `
-              mutation($ownerId: ID!, $title: String!) {
-                createProjectV2(input: { ownerId: $ownerId, title: $title }) {
+              mutation($repoId: ID!, $title: String!) {
+                createProjectV2(input: { ownerId: $repoId, title: $title }) {
                   projectV2 {
                     id
                     url
@@ -70,7 +56,7 @@ jobs:
             `;
 
             const createProjectResult = await github.graphql(createProjectMutation, {
-              ownerId,
+              repoId,
               title: projectTitle
             });
 
