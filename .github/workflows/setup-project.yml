@@ -29,49 +29,43 @@ jobs:
 
             core.info(`Setting up project for repository: ${ownerLogin}/${repoName}`);
 
-            // Try to create organization-level project if PROJECT_PAT is available
+            // Create a repository-linked project
             let project = null;
-            const hasPAT = process.env.GITHUB_TOKEN !== '${{ secrets.GITHUB_TOKEN }}';
 
-            if (hasPAT) {
-              try {
-                core.info('Attempting to create organization-level project...');
-                
-                // Get organization ID
-                const orgQuery = `
-                  query($login: String!) {
-                    organization(login: $login) { id }
-                  }
-                `;
-                const orgResult = await github.graphql(orgQuery, { login: ownerLogin });
-                const ownerId = orgResult.organization.id;
-
-                // Create ProjectV2 for organization
-                const createProjectMutation = `
-                  mutation($ownerId: ID!, $title: String!) {
-                    createProjectV2(input: { ownerId: $ownerId, title: $title }) {
-                      projectV2 {
-                        id
-                        url
-                      }
-                    }
-                  }
-                `;
-
-                const createProjectResult = await github.graphql(createProjectMutation, {
-                  ownerId,
-                  title: projectTitle
+            try {
+              core.info('Creating repository-linked project...');
+              
+              // Use REST API to create a classic project (repository-level)
+              // Note: ProjectsV2 (new projects) can only be created at org/user level
+              // Classic projects can be linked to repositories
+              const projectResponse = await github.rest.projects.createForRepo({
+                owner: ownerLogin,
+                repo: repoName,
+                name: projectTitle,
+                body: 'Automated project board for course tasks'
+              });
+              
+              project = projectResponse.data;
+              core.info(`✅ Created repository project: ${project.html_url}`);
+              
+              // Create default columns for the project
+              const columns = ['To Do', 'In Progress', 'Done'];
+              const createdColumns = [];
+              
+              for (const columnName of columns) {
+                const column = await github.rest.projects.createColumn({
+                  project_id: project.id,
+                  name: columnName
                 });
-
-                project = createProjectResult.createProjectV2.projectV2;
-                core.info(`✅ Created organization project: ${project.url}`);
-              } catch (error) {
-                core.warning(`Could not create organization project: ${error.message}`);
-                core.warning('Continuing with issues only...');
+                createdColumns.push(column.data);
+                core.info(`Created column: ${columnName}`);
               }
-            } else {
-              core.info('PROJECT_PAT not configured - will create issues only');
-              core.info('To enable automatic project creation, add a PROJECT_PAT secret with admin:org scope');
+              
+              project.columns = createdColumns;
+              
+            } catch (error) {
+              core.warning(`Could not create repository project: ${error.message}`);
+              core.warning('Continuing with issues only...');
             }
 
             // Define predefined tasks as issues
@@ -97,36 +91,48 @@ jobs:
 
             // Create issues for each task
             const createdIssues = [];
+            let issuesEnabled = true;
+
             for (const task of tasks) {
-              const issue = await github.rest.issues.create({
-                owner: ownerLogin,
-                repo: repoName,
-                title: task.title,
-                body: task.body,
-                labels: ["task"]
-              });
-              createdIssues.push(issue.data);
-              core.info(`Created issue #${issue.data.number}: ${issue.data.title}`);
+              try {
+                const issue = await github.rest.issues.create({
+                  owner: ownerLogin,
+                  repo: repoName,
+                  title: task.title,
+                  body: task.body,
+                  labels: ["task"]
+                });
+                createdIssues.push(issue.data);
+                core.info(`Created issue #${issue.data.number}: ${issue.data.title}`);
+              } catch (error) {
+                if (error.status === 404) {
+                  issuesEnabled = false;
+                  core.warning('Issues are not enabled for this repository!');
+                  core.warning('Please enable Issues in repository Settings → General → Features');
+                  break;
+                } else if (error.status === 410) {
+                  issuesEnabled = false;
+                  core.warning('Issues have been disabled for this repository!');
+                  break;
+                } else {
+                  throw error;
+                }
+              }
             }
 
             // If we created a project, add issues to it
-            if (project) {
+            if (project && createdIssues.length > 0) {
               core.info('Adding issues to project...');
-              const addItemMutation = `
-                mutation($projectId: ID!, $contentId: ID!) {
-                  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
-                    item {
-                      id
-                    }
-                  }
-                }
-              `;
-
+              
+              // Add issues to the "To Do" column (first column)
+              const todoColumn = project.columns[0];
+              
               for (const issue of createdIssues) {
                 try {
-                  await github.graphql(addItemMutation, {
-                    projectId: project.id,
-                    contentId: issue.node_id
+                  await github.rest.projects.createCard({
+                    column_id: todoColumn.id,
+                    content_id: issue.id,
+                    content_type: 'Issue'
                   });
                   core.info(`Added issue #${issue.number} to project`);
                 } catch (error) {
@@ -135,12 +141,19 @@ jobs:
               }
               
               core.notice(`✅ Successfully created ${createdIssues.length} task issues and added them to project!`);
-              core.notice(`📋 View project at: ${project.url}`);
-            } else {
+              core.notice(`📋 View project at: ${project.html_url}`);
+            } else if (project && !issuesEnabled) {
+              core.notice(`✅ Created repository project: ${project.html_url}`);
+              core.notice(`⚠️ Issues are not enabled - please enable them in repository settings`);
+              core.notice(`   Then manually add tasks to the project, or re-run this workflow`);
+            } else if (createdIssues.length > 0) {
               core.notice(`✅ Successfully created ${createdIssues.length} task issues!`);
               core.notice(`📋 View them at: https://github.com/${ownerLogin}/${repoName}/issues`);
-              core.notice(`💡 To enable automatic project creation:`);
-              core.notice(`   1. Create a Personal Access Token with 'admin:org' and 'project' scopes`);
-              core.notice(`   2. Add it as a repository secret named 'PROJECT_PAT'`);
-              core.notice(`   3. Re-run this workflow`);
+              core.notice(`💡 Project board was not created. Check repository permissions.`);
+            } else if (!issuesEnabled) {
+              core.setFailed('⚠️ Issues are not enabled for this repository!');
+              core.notice('Please enable Issues in: Repository Settings → General → Features → Issues');
+              if (project) {
+                core.notice(`Project was created: ${project.html_url}`);
+              }
             }
