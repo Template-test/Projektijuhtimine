@@ -173,12 +173,21 @@ jobs:
               // Link org Project (v2) to this repository when possible
               try {
                 core.info('Linking Project (v2) to current repository...');
+                // Preflight: ensure the App installation has access to this repository
+                try {
+                  await github.request('GET /repos/{owner}/{repo}', { owner: ownerLogin, repo: repoName });
+                } catch (preErr) {
+                  throw new Error(`App does not have access to ${ownerLogin}/${repoName}. Install the App on this repository.`);
+                }
+
+                // Fetch repository node ID
                 const repoNode = await github.graphql(`
                   query($owner: String!, $name: String!) {
                     repository(owner: $owner, name: $name) { id nameWithOwner }
                   }
                 `, { owner: ownerLogin, name: repoName });
 
+                // Perform link with Projects v2 feature header
                 const linkMutation = `
                   mutation($projectId: ID!, $repositoryId: ID!) {
                     linkProjectV2ToRepository(input: { projectId: $projectId, repositoryId: $repositoryId }) {
@@ -187,7 +196,12 @@ jobs:
                   }
                 `;
 
-                await github.graphql(linkMutation, { projectId: projectV2.id, repositoryId: repoNode.repository.id, headers: { 'GraphQL-Features': 'projects_next_graphql' } });
+                await github.request('POST /graphql', {
+                  query: linkMutation,
+                  variables: { projectId: projectV2.id, repositoryId: repoNode.repository.id },
+                  headers: { 'GraphQL-Features': 'projects_next_graphql' }
+                });
+
                 core.info('✅ Linked Project (v2) to repository');
                 core.notice('');
                 core.notice('🔗 Project (v2) linked to this repository.');
